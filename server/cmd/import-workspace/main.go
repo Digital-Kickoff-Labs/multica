@@ -12,7 +12,6 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -22,7 +21,6 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/multica-ai/multica/server/internal/issuestatus"
-	"github.com/multica-ai/multica/server/internal/storage"
 )
 
 const (
@@ -32,15 +30,17 @@ const (
 )
 
 type options struct {
-	archive        string
-	databaseURL    string
-	rewrites       []string
-	dryRun         bool
-	allowPartial   bool
-	allowDangling  bool
-	repairDangling bool
-	skipFiles      bool
-	allowExisting  bool
+	archive            string
+	databaseURL        string
+	rewrites           []string
+	emailMap           map[string]string
+	mergeExistingUsers bool
+	dryRun             bool
+	allowPartial       bool
+	allowDangling      bool
+	repairDangling     bool
+	skipFiles          bool
+	allowExisting      bool
 }
 
 type rewriteFlag struct{ values *[]string }
@@ -54,10 +54,24 @@ func (r rewriteFlag) Set(v string) error {
 	return nil
 }
 
+type emailMapFlag map[string]string
+
+func (m emailMapFlag) String() string { return "" }
+func (m emailMapFlag) Set(v string) error {
+	from, to, ok := strings.Cut(v, "=")
+	if !ok || !strings.Contains(from, "@") || !strings.Contains(to, "@") {
+		return fmt.Errorf("--email-map expects OLD@EXAMPLE.COM=NEW@EXAMPLE.COM, got %q", v)
+	}
+	m[strings.ToLower(strings.TrimSpace(from))] = strings.TrimSpace(to)
+	return nil
+}
+
 func main() {
-	var opts options
+	opts := options{emailMap: map[string]string{}}
 	flag.StringVar(&opts.archive, "archive", "", "directory written by `multica workspace export` (required)")
 	flag.Var(rewriteFlag{&opts.rewrites}, "rewrite", "FROM=TO text replacement applied to every imported row, e.g. https://multica.ai=https://multica.example.com (repeatable)")
+	flag.Var(emailMapFlag(opts.emailMap), "email-map", "OLD=NEW email applied to an archived account before import (repeatable)")
+	flag.BoolVar(&opts.mergeExistingUsers, "merge-existing-users", false, "attach archived accounts to target accounts that already use the same email instead of aborting")
 	flag.BoolVar(&opts.dryRun, "dry-run", false, "run the whole import, report, then roll back")
 	flag.BoolVar(&opts.allowPartial, "allow-partial", false, "accept an archive without manifest.json (interrupted export)")
 	flag.BoolVar(&opts.allowDangling, "allow-dangling", false, "commit even when rows reference records missing from the archive")
@@ -108,17 +122,43 @@ func run(ctx context.Context, opts options) error {
 		}
 	}
 
-	pairs := make([]string, 0, 2*len(opts.rewrites))
+	members, err := readMembers(opts.archive, opts.emailMap)
+	if err != nil {
+		return err
+	}
+	conflicts, err := findAccountConflicts(ctx, conn, members)
+	if err != nil {
+		return err
+	}
+	if len(conflicts) > 0 && !opts.mergeExistingUsers {
+		return accountConflictError(conflicts)
+	}
+
+	fs, err := openFileStore(opts)
+	if err != nil {
+		return err
+	}
+	files, err := uploadAttachments(ctx, opts.archive, fs)
+	if err != nil {
+		return err
+	}
+	avatars, err := uploadAvatars(ctx, opts.archive, workspaceID, fs)
+	if err != nil {
+		return err
+	}
+	pairs := contentLinkPairs(files)
+	for _, c := range conflicts {
+		pairs = append(pairs, c.archivedID, c.existingID)
+	}
 	for _, r := range opts.rewrites {
 		from, to, _ := strings.Cut(r, "=")
 		pairs = append(pairs, from, to)
 	}
-	files, err := uploadAttachments(ctx, opts)
-	if err != nil {
-		return err
-	}
-	for oldURL, newURL := range files {
-		pairs = append([]string{oldURL, newURL}, pairs...)
+	storedURLs := map[string]string{}
+	for _, f := range files {
+		if f.newURL != "" {
+			storedURLs[f.id] = f.newURL
+		}
 	}
 
 	tx, err := conn.Begin(ctx)
@@ -133,7 +173,11 @@ func run(ctx context.Context, opts options) error {
 	}
 
 	im := &importer{tx: tx, workspaceID: workspaceID, replacer: strings.NewReplacer(pairs...),
-		columns: map[string]map[string]column{}, stats: map[string]*tableStats{}}
+		columns: map[string]map[string]column{}, stats: map[string]*tableStats{},
+		emailMap: opts.emailMap, ownerID: ownerID(members), avatars: avatars, storedURLs: storedURLs, files: fs}
+	for _, c := range conflicts {
+		im.manual = append(im.manual, fmt.Sprintf("account %s: merged into the existing target account %s", c.email, c.existingID))
+	}
 	if err := im.importArchive(ctx, opts.archive, workspace.Workspace); err != nil {
 		return err
 	}
@@ -188,6 +232,11 @@ type importer struct {
 	stats       map[string]*tableStats
 	manual      []string
 	repaired    []string
+	emailMap    map[string]string
+	ownerID     string
+	avatars     map[string]storedAvatar
+	storedURLs  map[string]string
+	files       *fileStore
 }
 
 func (im *importer) importArchive(ctx context.Context, dir string, workspace map[string]any) error {
@@ -195,6 +244,9 @@ func (im *importer) importArchive(ctx context.Context, dir string, workspace map
 		MCPServers json.RawMessage `json:"mcp_servers"`
 	}
 	_ = readJSON(filepath.Join(dir, "workspace.json"), &ws)
+	if err := im.importAvatar(ctx, workspace, "workspace "+str(workspace, "name"), im.ownerID); err != nil {
+		return err
+	}
 	if err := im.insert(ctx, "workspace", workspace); err != nil {
 		return err
 	}
@@ -203,7 +255,11 @@ func (im *importer) importArchive(ctx context.Context, dir string, workspace map
 	}
 
 	if err := eachLine(dir, "members.jsonl", func(m map[string]any) error {
+		m["email"] = mappedEmail(str(m, "email"), im.emailMap)
 		user := map[string]any{"id": m["user_id"], "name": m["name"], "email": m["email"], "avatar_url": m["avatar_url"]}
+		if err := im.importAvatar(ctx, user, "user "+str(m, "email"), m["user_id"]); err != nil {
+			return err
+		}
 		if err := im.insert(ctx, "user", user); err != nil {
 			return err
 		}
@@ -250,6 +306,22 @@ func (im *importer) importArchive(ctx context.Context, dir string, workspace map
 	return nil
 }
 
+// importAvatar points avatar_url at the copy stored by uploadAvatars, backed by
+// the unbound image attachment row that makes it publishable on the target.
+func (im *importer) importAvatar(ctx context.Context, row map[string]any, owner string, uploaderID any) error {
+	raw, _ := row["avatar_url"].(string)
+	if avatar, ok := im.avatars[raw]; ok {
+		row["avatar_url"] = avatar.url
+		return im.insert(ctx, "attachment", map[string]any{"id": avatar.id, "uploader_type": "member", "uploader_id": uploaderID,
+			"filename": avatar.filename, "url": avatar.url, "content_type": avatar.contentType, "size_bytes": avatar.size})
+	}
+	if isServedAvatarURL(raw) {
+		row["avatar_url"] = nil
+		im.manual = append(im.manual, owner+": avatar is not in the archive, cleared")
+	}
+	return nil
+}
+
 func (im *importer) importAgents(ctx context.Context, dir string) error {
 	return eachLine(dir, "agents.jsonl", func(rec map[string]any) error {
 		agent := detailOrItem(rec)
@@ -258,6 +330,9 @@ func (im *importer) importAgents(ctx context.Context, dir string) error {
 		}
 		if raw, ok := rec["env"]; ok && remarshal(raw, &env) == nil && env.CustomEnv != nil {
 			agent["custom_env"] = env.CustomEnv
+		}
+		if err := im.importAvatar(ctx, agent, "agent "+str(agent, "name"), im.ownerID); err != nil {
+			return err
 		}
 		if err := im.insert(ctx, "agent", agent); err != nil {
 			return err
@@ -324,6 +399,9 @@ func skillVersionHash(version map[string]any) string {
 func (im *importer) importSquads(ctx context.Context, dir string) error {
 	return eachLine(dir, "squads.jsonl", func(rec map[string]any) error {
 		squad := detailOrItem(rec)
+		if err := im.importAvatar(ctx, squad, "squad "+str(squad, "name"), im.ownerID); err != nil {
+			return err
+		}
 		if err := im.insert(ctx, "squad", squad); err != nil {
 			return err
 		}
@@ -633,6 +711,9 @@ func (im *importer) importAttachments(ctx context.Context, dir string) error {
 		if err := readJSON(path, &meta); err != nil {
 			return err
 		}
+		if url, ok := im.storedURLs[str(meta, "id")]; ok {
+			meta["url"] = url
+		}
 		if err := im.insert(ctx, "attachment", meta); err != nil {
 			return err
 		}
@@ -703,7 +784,7 @@ func (im *importer) insert(ctx context.Context, table string, row map[string]any
 	ident := pgx.Identifier{table}.Sanitize()
 	query := fmt.Sprintf(`INSERT INTO %s (%s) SELECT %s FROM jsonb_populate_record(NULL::%s, $1::jsonb) ON CONFLICT DO NOTHING`,
 		ident, list, list, ident)
-	tag, err := im.tx.Exec(ctx, query, im.replacer.Replace(string(payload)))
+	tag, err := im.tx.Exec(ctx, query, relativizeAttachmentLinks(im.replacer.Replace(string(payload))))
 	if err != nil {
 		return fmt.Errorf("insert %s %v: %w", table, row["id"], err)
 	}
@@ -778,6 +859,10 @@ func (im *importer) printReport(manifest *manifest, dangling []string) {
 		}
 		sort.Strings(dropped)
 		fmt.Printf("%-26s %9d %9d  %s\n", t, s.inserted, s.existing, strings.Join(dropped, ","))
+	}
+	if im.files != nil {
+		fmt.Printf("files written: %d (%d attachments, %d avatars); missing from the archive: %d\n",
+			im.files.stats.attachments+im.files.stats.avatars, im.files.stats.attachments, im.files.stats.avatars, im.files.stats.missing)
 	}
 	for _, m := range im.manual {
 		fmt.Println("to reconfigure:", m)
@@ -869,58 +954,6 @@ func (im *importer) checkDangling(ctx context.Context, repair bool) ([]string, e
 		}
 	}
 	return dangling, nil
-}
-
-// uploadAttachments copies archived files into the server's configured storage
-// and returns old URL -> new URL so imported content links follow the move.
-func uploadAttachments(ctx context.Context, opts options) (map[string]string, error) {
-	moved := map[string]string{}
-	if opts.skipFiles {
-		return moved, nil
-	}
-	metas, err := filepath.Glob(filepath.Join(opts.archive, "attachments", "*", "meta.json"))
-	if err != nil || len(metas) == 0 {
-		return moved, err
-	}
-	var store storage.Storage
-	if s3 := storage.NewS3StorageFromEnv(); s3 != nil {
-		store = s3
-	} else if local := storage.NewLocalStorageFromEnv(); local != nil {
-		store = local
-	} else {
-		return nil, errors.New("no attachment storage configured (S3_BUCKET or LOCAL_UPLOAD_DIR); use --skip-files to import rows only")
-	}
-	for _, metaPath := range metas {
-		var meta map[string]any
-		if err := readJSON(metaPath, &meta); err != nil {
-			return nil, err
-		}
-		oldURL := str(meta, "url")
-		key := storageKey(oldURL)
-		name := filepath.Base(str(meta, "filename"))
-		data, err := os.ReadFile(filepath.Join(filepath.Dir(metaPath), name))
-		if err != nil || key == "" || opts.dryRun {
-			if err != nil {
-				slog.Warn("attachment file missing from archive", "id", meta["id"], "error", err)
-			}
-			continue
-		}
-		newURL, err := store.Upload(ctx, key, data, str(meta, "content_type"), name)
-		if err != nil {
-			return nil, fmt.Errorf("upload %s: %w", key, err)
-		}
-		moved[oldURL] = newURL
-	}
-	return moved, nil
-}
-
-func storageKey(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return ""
-	}
-	// Local storage serves its keys under /uploads/ and adds it back on upload.
-	return strings.TrimPrefix(strings.TrimPrefix(u.Path, "/"), "uploads/")
 }
 
 type manifest struct {
