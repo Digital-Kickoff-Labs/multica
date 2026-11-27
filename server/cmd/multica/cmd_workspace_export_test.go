@@ -21,17 +21,21 @@ const (
 	exportTestChatFileID   = "44444444-4444-4444-4444-444444444444"
 
 	exportTestAutopilotRuns = 230
+
+	exportTestWorkspaceAvatar = "/api/avatars/c2lnLXdz/workspaces/ws-1/55555555-5555-5555-5555-555555555555.png"
+	exportTestAgentAvatar     = "/api/avatars/c2lnLWFn/workspaces/ws-1/66666666-6666-6666-6666-666666666666.webp"
+	exportTestOAuthAvatar     = "https://avatars.example.com/u/1.png"
 )
 
 func newExportTestServer(t *testing.T, requested *sync.Map) *httptest.Server {
 	t.Helper()
 	routes := map[string]any{
 		"/api/config":                  map[string]any{"version": "test"},
-		"/api/workspaces/ws-1":         map[string]any{"id": "ws-1", "name": "Acme"},
-		"/api/workspaces/ws-1/members": []any{map[string]any{"id": "m-1", "user_id": "u-1", "email": "a@example.com"}},
+		"/api/workspaces/ws-1":         map[string]any{"id": "ws-1", "name": "Acme", "avatar_url": exportTestWorkspaceAvatar},
+		"/api/workspaces/ws-1/members": []any{map[string]any{"id": "m-1", "user_id": "u-1", "email": "a@example.com", "avatar_url": exportTestOAuthAvatar}},
 		"/api/labels":                  []any{map[string]any{"id": "l-1", "name": "bug"}},
 		"/api/agents":                  []any{map[string]any{"id": "a-1", "name": "Builder"}},
-		"/api/agents/a-1":              map[string]any{"id": "a-1", "name": "Builder", "instructions": "Ship it"},
+		"/api/agents/a-1":              map[string]any{"id": "a-1", "name": "Builder", "instructions": "Ship it", "avatar_url": exportTestAgentAvatar},
 		"/api/agents/a-1/env":          map[string]any{"env": map[string]any{"TOKEN": "secret"}},
 		"/api/skills":                  []any{},
 		"/api/docs":                    map[string]any{"folders": []any{map[string]any{"id": "f-1"}}, "docs": []any{map[string]any{"id": "d-1"}}},
@@ -74,6 +78,9 @@ func newExportTestServer(t *testing.T, requested *sync.Map) *httptest.Server {
 			return
 		case "/api/attachments/" + exportTestAttachmentID + "/download":
 			_, _ = w.Write([]byte("PNGDATA"))
+			return
+		case exportTestWorkspaceAvatar, exportTestAgentAvatar:
+			_, _ = w.Write([]byte("AVATAR:" + r.URL.Path))
 			return
 		case "/api/attachments/" + exportTestChatFileID + "/download":
 			_, _ = w.Write([]byte("CHATDATA"))
@@ -310,5 +317,40 @@ func TestWorkspaceExportIncludesArchivedChats(t *testing.T) {
 	_, requested := runExportForTest(t, nil)
 	if _, ok := requested.Load("/api/chat/sessions?status=all"); !ok {
 		t.Fatal("chat sessions must be listed with status=all, or archived chats are lost")
+	}
+}
+
+func TestWorkspaceExportDownloadsServedAvatarsOnly(t *testing.T) {
+	out, requested := runExportForTest(t, nil)
+
+	data, err := os.ReadFile(filepath.Join(out, "avatars", "index.jsonl"))
+	if err != nil {
+		t.Fatalf("avatar index missing: %v", err)
+	}
+	files := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var entry exportedAvatar
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("decode %q: %v", line, err)
+		}
+		files[entry.URL] = entry.File
+	}
+	if len(files) != 2 || files[exportTestOAuthAvatar] != "" {
+		t.Fatalf("index = %v, want the workspace and agent avatars only", files)
+	}
+	for _, avatar := range []string{exportTestWorkspaceAvatar, exportTestAgentAvatar} {
+		got, err := os.ReadFile(filepath.Join(out, "avatars", files[avatar]))
+		if err != nil || string(got) != "AVATAR:"+avatar {
+			t.Fatalf("avatar %s = %q, %v", avatar, got, err)
+		}
+		if !strings.HasSuffix(files[avatar], filepath.Base(avatar)) {
+			t.Fatalf("file %q must keep the object name %q", files[avatar], filepath.Base(avatar))
+		}
+	}
+	if _, ok := requested.Load("/u/1.png"); ok {
+		t.Fatal("third-party avatars must not be downloaded")
+	}
+	if got := readExportManifest(t, out).Counts["avatars"]; got != 2 {
+		t.Fatalf("manifest avatars count = %d", got)
 	}
 }

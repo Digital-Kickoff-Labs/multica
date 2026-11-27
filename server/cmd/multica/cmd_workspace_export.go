@@ -35,8 +35,8 @@ var workspaceExportCmd = &cobra.Command{
 		"Read-only: nothing is modified on the server. Re-running with the same --out " +
 		"resumes, skipping issues already exported. Agent environment secrets are only " +
 		"exported with --include-secrets, and every secret read is audited server-side.",
-	Example: "  multica workspace export --out ./dkl-export\n" +
-		"  multica workspace export --out ./dkl-export --include-secrets --concurrency 8",
+	Example: "  multica workspace export --out ./workspace-export\n" +
+		"  multica workspace export --out ./workspace-export --include-secrets --concurrency 8",
 	Args: cobra.NoArgs,
 	RunE: runWorkspaceExport,
 }
@@ -131,6 +131,7 @@ func runWorkspaceExport(cmd *cobra.Command, _ []string) error {
 		x.exportAgents,
 		x.exportSkills,
 		x.exportSquads,
+		x.exportAvatars,
 		x.exportProjects,
 		x.exportAutopilots,
 		x.exportDocs,
